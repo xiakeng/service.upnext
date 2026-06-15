@@ -14,11 +14,6 @@ else
 	zip_name = $(name)-$(version)-$(git_branch)-$(git_hash).zip
 endif
 
-include_files = addon.xml LICENSE README.md resources/
-include_paths = $(patsubst %,$(name)/%,$(include_files))
-exclude_files = \*.new \*.orig \*.pyc \*.pyo
-zip_dir = $(name)/
-
 languages = $(filter-out en_gb, $(patsubst resources/language/resource.language.%, %, $(wildcard resources/language/*)))
 
 blue = \e[1;34m
@@ -68,9 +63,26 @@ test-run:
 
 build: clean
 	@printf "$(white)=$(blue) Building new package$(reset)\n"
-	@rm -f ../$(zip_name)
-	cd ..; zip -r $(zip_name) $(include_paths) -x $(exclude_files)
-	@printf "$(white)=$(blue) Successfully wrote package as: $(white)../$(zip_name)$(reset)"
+	@rm -f $(zip_name)
+	$(PYTHON) -c "\
+import zipfile, os, fnmatch; \
+excludes = ['*.new', '*.orig', '*.pyc', '*.pyo']; \
+include_files = ['addon.xml', 'LICENSE', 'README.md', 'resources/']; \
+name = '$(name)'; \
+zf = zipfile.ZipFile('$(zip_name)', 'w', zipfile.ZIP_DEFLATED); \
+[\
+    [\
+        zf.write(os.path.join(root, f), os.path.join(name, root, f)) \
+        for f in files \
+        if not any(fnmatch.fnmatch(f, pat) for pat in excludes) \
+    ] if os.path.isdir(inc) \
+    else (zf.write(inc, os.path.join(name, inc)) if not any(fnmatch.fnmatch(inc, pat) for pat in excludes) else None) \
+    for inc in include_files \
+    for root, dirs, files in ([('.', [], [inc])] if not os.path.isdir(inc) else os.walk(inc)) \
+]; \
+zf.close() \
+"
+	@printf "$(white)=$(blue) Successfully wrote package as: $(white)$(zip_name)$(reset)\n"
 
 multizip: clean
 	@-$(foreach abi,$(KODI_PYTHON_ABIS), \
@@ -87,7 +99,9 @@ codecov:
 
 clean:
 	@printf "$(white)=$(blue) Cleaning up$(reset)\n"
-	find . -name '*.py[cod]' -type f -delete
-	find . -name '__pycache__' -type d -delete
+	-powershell -Command "Get-ChildItem -Path . -Filter '*.pyc' -Recurse | Remove-Item -Force"
+	-powershell -Command "Get-ChildItem -Path . -Filter '*.pyo' -Recurse | Remove-Item -Force"
+	-powershell -Command "Get-ChildItem -Path . -Filter '*.pyd' -Recurse | Remove-Item -Force"
+	-powershell -Command "Get-ChildItem -Path . -Filter '__pycache__' -Recurse -Directory | Remove-Item -Force -Recurse"
 	rm -rf .pytest_cache/ .tox/
 	rm -f *.log
