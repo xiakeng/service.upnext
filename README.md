@@ -18,5 +18,11 @@ The add-on has various settings to fine-tune the experience, however the default
 
 For [Addon Integration](https://github.com/im85288/service.upnext/wiki/Integration) and [Skinners](https://github.com/im85288/service.upnext/wiki/Skinners) see the [wiki](https://github.com/im85288/service.upnext/wiki)
 
+## Dependencies
+  * php version <= 3.12
+  * shell env need to install xsltproc
+
 ## Difference vs orign repo
   * automatically play next episode after 10 secs
+  * makefile use php zip module instead of shell zip
+  * makefile clean step rewrite it to be running on windows machine
