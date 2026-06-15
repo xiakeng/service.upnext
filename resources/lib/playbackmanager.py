@@ -23,6 +23,8 @@ class PlaybackManager:
         self.state = State()
         self.player = UpNextPlayer()
         self.demo = DemoOverlay(12005)
+        self.notify_start = 0
+        self.duration = 10
 
     def log(self, msg, level=2):
         ulog(msg, name=self.__class__.__name__, level=level)
@@ -39,7 +41,19 @@ class PlaybackManager:
         else:
             self.demo.hide()
 
-    def launch_up_next(self):
+    def launch_up_next(self, start):
+        play_time = self.player.getTime()
+        total_time = self.player.getTotalTime()
+        self.notify_start = start
+
+        # calculate new notify_start based on when the nextup is initialized, if the play_time already behind actual start.
+        if start + self.duration - 3 < play_time:
+            self.notify_start = play_time - 3
+
+        # if calculated notify_start + duration is greater than total time, recalculate it based on total_time.
+        if self.notify_start + self.duration > total_time:
+            self.notify_start = total_time - self.duration + 3
+
         enable_playlist = get_setting_bool('enablePlaylist')
         episode, source = self.play_item.get_next()
         self.log('Playlist setting: %s' % enable_playlist)
@@ -141,7 +155,7 @@ class PlaybackManager:
     def show_popup_and_wait(self, episode, next_up_page, still_watching_page):
         try:
             play_time = self.player.getTime()
-            total_time = self.player.getTotalTime()
+            total_time = self.notify_start + self.duration
         except RuntimeError:
             self.log('exit early because player is no longer running', 2)
             return False, False
@@ -170,7 +184,7 @@ class PlaybackManager:
                and not still_watching_page.is_still_watching() and not still_watching_page.is_cancel()):
             try:
                 play_time = self.player.getTime()
-                total_time = self.player.getTotalTime()
+                total_time = self.notify_start + self.duration
             except RuntimeError:
                 if showing_next_up_page:
                     next_up_page.close()
