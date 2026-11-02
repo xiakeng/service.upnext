@@ -2,6 +2,14 @@
 
 # Up Next - Proposes to play the next episode automatically
 
+## Archived: use upstream for credits autoplay
+
+This fork is no longer maintained. [Upstream Up Next](https://github.com/im85288/service.upnext) supports automatic next-episode playback during provider-supplied credits since [v1.2.2](https://github.com/im85288/service.upnext/releases/tag/v1.2.2).
+
+Use upstream and set **Advance during credits after (seconds, 0 disables)** to **10** for a ten-second countdown. The default is 0 (disabled). Your playback add-on must supply the credits start time through `notification_offset`, as [xiakeng/jellyfin-kodi](https://github.com/xiakeng/jellyfin-kodi) does.
+
+Neither upstream nor this archived fork implements the proposed two-second safety margin when fewer than ten seconds remain. The documentation below describes this fork's historical behavior.
+
 This Kodi add-on shows a Netflix-style notification for watching the next episode. After a few automatic iterations it asks the user if they are still watching.
 
 A lot of existing add-ons already integrate with this service out-of-the-box.
