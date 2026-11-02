@@ -94,6 +94,22 @@ msgctxt "#30049"
 msgid "Next Episode"
 msgstr "Další epizoda"
 
+msgctxt "#30050"
+msgid "Next episode in $INFO[Window.Property(credits_remaining)] s"
+msgstr "Další díl za $INFO[Window.Property(credits_remaining)] s"
+
+msgctxt "#30051"
+msgid "Back: keep watching"
+msgstr "Zpět: sledovat dál"
+
+msgctxt "#30052"
+msgid "Skip intro"
+msgstr ""
+
+msgctxt "#30053"
+msgid "Skip recap"
+msgstr ""
+
 msgctxt "#30060"
 msgid "[B]UP NEXT DEMO MODE ENABLED[/B]"
 msgstr ""
@@ -119,6 +135,10 @@ msgstr "Nastavit vzhled pro upozornění"
 msgctxt "#30505"
 msgid "Show a \"Stop\" button instead of a \"Close\" button"
 msgstr "Zobrazit tlačítko \"Zastavení\" místo \"Zavření\""
+
+msgctxt "#30507"
+msgid "Use OK/Select for playback controls"
+msgstr "Tlačítkem OK otevřít ovládání přehrávání"
 
 msgctxt "#30600"
 msgid "Behaviour"
@@ -172,6 +192,42 @@ msgctxt "#30623"
 msgid "Very long episodes  [COLOR gray]> 60 mins[/COLOR]"
 msgstr "Velmi dlouhé epizody  [COLOR gray]> 60 min[/COLOR]"
 
+msgctxt "#30625"
+msgid "Advance during credits after (seconds, 0 disables)"
+msgstr "Za kolik sekund přejít během titulků (0 = vypnuto)"
+
+msgctxt "#30627"
+msgid "Intros and recaps"
+msgstr ""
+
+msgctxt "#30629"
+msgid "Show a Skip button when the add-on marks them"
+msgstr ""
+
+msgctxt "#30631"
+msgid "Skip intros automatically"
+msgstr ""
+
+msgctxt "#30633"
+msgid "Skip recaps automatically"
+msgstr ""
+
+msgctxt "#30635"
+msgid "Ask if still watching after (minutes, 0 disables)"
+msgstr "Zeptat se, zda stále sleduji, po (minuty; 0 = vypnuto)"
+
+msgctxt "#30637"
+msgid "Ask if still watching after bedtime"
+msgstr "Zeptat se, zda stále sleduji, po večerce"
+
+msgctxt "#30639"
+msgid "Bedtime hour"
+msgstr "Hodina večerky"
+
+msgctxt "#30641"
+msgid "Bedtime minute"
+msgstr "Minuta večerky"
+
 msgctxt "#30700"
 msgid "Expert"
 msgstr "Expert"
@@ -211,3 +267,7 @@ msgstr "Zobrazit pop-up ověření pozornosti…"
 msgctxt "#30811"
 msgid "Show a StillWatchingSimple pop-up…"
 msgstr "Zobrazit jednoduchý pop-up ověření pozornosti…"
+
+msgctxt "#30813"
+msgid "Test Skip button"
+msgstr ""

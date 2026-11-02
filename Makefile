@@ -1,12 +1,10 @@
 export PYTHONPATH := $(CURDIR)/resources/lib/:$(CURDIR)/tests/
 PYTHON := python
-KODI_PYTHON_ABIS := 3.0.0 2.25.0
 
 name = $(shell xmllint --xpath 'string(/addon/@id)' addon.xml)
 version = $(shell xmllint --xpath 'string(/addon/@version)' addon.xml)
 git_branch = $(shell git rev-parse --abbrev-ref HEAD)
 git_hash = $(shell git rev-parse --short HEAD)
-matrix = $(findstring $(shell xmllint --xpath 'string(/addon/requires/import[@addon="xbmc.python"]/@version)' addon.xml), $(word 1,$(KODI_PYTHON_ABIS)))
 
 ifdef release
 	zip_name = $(name)-$(version).zip
@@ -42,7 +40,7 @@ check-translations:
 
 check-addon: clean
 	@printf "$(white)=$(blue) Starting sanity addon tests$(reset)\n"
-	kodi-addon-checker . --branch=leia
+	kodi-addon-checker . --branch=matrix
 
 unit: test-unit
 run: test-run
@@ -83,15 +81,6 @@ zf = zipfile.ZipFile('$(zip_name)', 'w', zipfile.ZIP_DEFLATED); \
 zf.close() \
 "
 	@printf "$(white)=$(blue) Successfully wrote package as: $(white)$(zip_name)$(reset)\n"
-
-multizip: clean
-	@-$(foreach abi,$(KODI_PYTHON_ABIS), \
-		printf "cd /addon/requires/import[@addon='xbmc.python']/@version\nset $(abi)\nsave\nbye\n" | xmllint --shell addon.xml; \
-		matrix=$(findstring $(abi), $(word 1,$(KODI_PYTHON_ABIS))); \
-		if [ $$matrix ]; then version=$(version)+matrix.1; else version=$(version); fi; \
-		printf "cd /addon/@version\nset $$version\nsave\nbye\n" | xmllint --shell addon.xml; \
-		make build; \
-	)
 
 codecov:
 	@printf "$(white)=$(blue) Test codecov.yml syntax$(reset)\n"

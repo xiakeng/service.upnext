@@ -1,20 +1,28 @@
 # -*- coding: utf-8 -*-
 # GNU General Public License v2.0 (see COPYING or https://www.gnu.org/licenses/gpl-2.0.txt)
 
-from __future__ import absolute_import, division, unicode_literals
+from math import ceil
+from time import monotonic
 from xbmc import sleep
-from api import Api
+from api import Api, credits_autoplay_deadline, get_watched_state, mark_watched, playing_episode_id
 from demo import DemoOverlay
 from player import UpNextPlayer
 from playitem import PlayItem
 from state import State
 from stillwatching import StillWatching
 from upnext import UpNext
-from utils import addon_path, calculate_progress_steps, clear_property, event, get_setting_bool, get_setting_int, log as ulog, set_property
+from utils import (addon_path, calculate_progress_steps, clear_property, event, get_int, get_setting_bool, get_setting_int,
+                   log as ulog, set_property)
+
+# How long to let Kodi save the previous episode's own watched state before checking it (seconds)
+WATCHED_CHECK_DELAY = 10
+# How long the next episode may take to start before the previous one is left as Kodi saved it (seconds)
+WATCHED_SWITCH_TIMEOUT = 60
 
 
 class PlaybackManager:
     _shared_state = {}
+    popup_shown = False  # whether the last launch_up_next() actually showed a popup
 
     def __init__(self):
         self.__dict__ = self._shared_state
@@ -23,8 +31,8 @@ class PlaybackManager:
         self.state = State()
         self.player = UpNextPlayer()
         self.demo = DemoOverlay(12005)
-        self.notify_start = 0
-        self.duration = 10
+        self._watch_limit_check_at = 0
+        self._watched_checks = []  # episodes Up Next moved on from, to check once Kodi saved them
 
     def log(self, msg, level=2):
         ulog(msg, name=self.__class__.__name__, level=level)
@@ -41,31 +49,35 @@ class PlaybackManager:
         else:
             self.demo.hide()
 
-    def launch_up_next(self, start):
-        play_time = self.player.getTime()
-        total_time = self.player.getTotalTime()
-        self.notify_start = start
-
-        # calculate new notify_start based on when the nextup is initialized, if the play_time already behind actual start.
-        if start + self.duration - 3 < play_time:
-            self.notify_start = play_time - 3
-
-        # if calculated notify_start + duration is greater than total time, recalculate it based on total_time.
-        if self.notify_start + self.duration > total_time:
-            self.notify_start = total_time - self.duration + 3
-
+    def launch_up_next(self):
+        """Show the popup and act on it. Returns True if other playback replaced the episode while the popup was open"""
+        self.popup_shown = False
         enable_playlist = get_setting_bool('enablePlaylist')
         episode, source = self.play_item.get_next()
         self.log('Playlist setting: %s' % enable_playlist)
         if source == 'playlist' and not enable_playlist:
             self.log('Playlist integration disabled', 2)
-            return
+            return False
         if not episode:
             # No episode get out of here
             self.log('Error: no episode could be found to play next...exiting', 1)
-            return
+            return False
         self.log('episode details %s' % episode, 2)
+        try:
+            playing_file = self.player.getPlayingFile()
+        except RuntimeError:
+            self.log('No active playback for the next-episode popup', 2)
+            return False
         play_next, keep_playing = self.launch_popup(episode, source)
+        if not play_next:
+            try:
+                current_file = self.player.getPlayingFile()
+            except RuntimeError:
+                current_file = None
+            if current_file != playing_file:
+                self.log('Playback changed while the popup was open; skipping stale cleanup', 2)
+                # Another file is playing now, its tracking must stay enabled
+                return current_file is not None
         self.state.playing_next = play_next
 
         # Dequeue and stop playback if not playing next file
@@ -76,6 +88,7 @@ class PlaybackManager:
             self.player.stop()
 
         self.api.reset_addon_data()
+        return False
 
     def launch_popup(self, episode, source=None):
         episode_id = episode.get('episodeid')
@@ -102,9 +115,7 @@ class PlaybackManager:
             next_up_page = UpNext('script-upnext-upnext.xml', addon_path(), 'default', '1080i')
             still_watching_page = StillWatching('script-upnext-stillwatching.xml', addon_path(), 'default', '1080i')
 
-        showing_next_up_page, showing_still_watching_page = self.show_popup_and_wait(episode,
-                                                                                     next_up_page,
-                                                                                     still_watching_page)
+        showing_next_up_page, showing_still_watching_page = self._show_popup(episode, next_up_page, still_watching_page)
         should_play_default, should_play_non_default = self.extract_play_info(next_up_page,
                                                                               showing_next_up_page,
                                                                               showing_still_watching_page,
@@ -121,6 +132,9 @@ class PlaybackManager:
         play_item_option_1 = (should_play_default and self.state.play_mode == 0)
         play_item_option_2 = (should_play_non_default and self.state.play_mode == 1)
         if not play_item_option_1 and not play_item_option_2:
+            if next_up_page.is_dismissed() if showing_next_up_page else still_watching_page.is_dismissed():
+                # Back dismisses the prompt without stopping the current video.
+                return False, True
             # play_next = False
             # keep_playing = next_up_page.is_cancel() if showing_next_up_page else still_watching_page.is_cancel()
             # keep_playing = keep_playing and not get_setting_bool('stopAfterClose')
@@ -134,10 +148,11 @@ class PlaybackManager:
         self.log('playing media episode', 2)
         # Signal to trakt previous episode watched
         event(message='NEXTUPWATCHEDSIGNAL', data={'episodeid': self.state.current_episode_id}, encoding='base64')
+        self.remember_watched_state(self.state.current_episode_id, source, episode.get('episodeid'))
         if source == 'playlist' or queued:
             # Play playlist media
-            if should_play_non_default:
-                # Only start the next episode if the user asked for it specifically
+            if should_play_non_default or next_up_page.is_auto_advance():
+                # Early credits expiry must also advance an already queued item.
                 self.player.playnext()
         elif self.api.has_addon_data():
             # Play add-on media
@@ -152,40 +167,62 @@ class PlaybackManager:
         # Play next file, and keep playing current file
         return True, True
 
+    def _show_popup(self, episode, next_up_page, still_watching_page):
+        """Show the popup and wait for it, closing it again if anything goes wrong while it is open"""
+        try:
+            return self.show_popup_and_wait(episode, next_up_page, still_watching_page)
+        except Exception:
+            # Don't leave a frozen popup on screen, the service loop logs the error and carries on
+            next_up_page.close()
+            still_watching_page.close()
+            clear_property('service.upnext.dialog')
+            raise
+
     def show_popup_and_wait(self, episode, next_up_page, still_watching_page):
         try:
             play_time = self.player.getTime()
-            total_time = self.notify_start + self.duration
+            total_time = self.player.getTotalTime()
+            playing_file = self.player.getPlayingFile()
         except RuntimeError:
             self.log('exit early because player is no longer running', 2)
             return False, False
-        progress_step_size = calculate_progress_steps(total_time - play_time)
+        popup_deadline = min(total_time, play_time + 10)
+        remaining = popup_deadline - play_time
+        # Keep the fork's ten-second timeout, using the upstream early-advance path for queued items too.
+        credits_deadline = (min(credits_autoplay_deadline(self.api.has_addon_data(), play_time, total_time) or popup_deadline, popup_deadline)
+                            if self.state.play_mode == 0 else None)
+        credits_duration = credits_deadline - play_time if credits_deadline is not None else 0
         next_up_page.set_item(episode)
-        next_up_page.set_progress_step_size(progress_step_size)
+        next_up_page.set_progress_step_size(calculate_progress_steps(remaining))
         still_watching_page.set_item(episode)
-        still_watching_page.set_progress_step_size(progress_step_size)
+        still_watching_page.set_progress_step_size(calculate_progress_steps(remaining))
         played_in_a_row_number = get_setting_int('playedInARow')
         self.log('played in a row settings %s' % played_in_a_row_number, 2)
         self.log('played in a row %s' % self.state.played_in_a_row, 2)
         showing_next_up_page = False
         showing_still_watching_page = False
-        if not played_in_a_row_number or int(self.state.played_in_a_row) < int(played_in_a_row_number):
+        self._watch_limit_check_at = 0
+        if not self.still_watching_due(played_in_a_row_number):
             self.log('showing next up page as played in a row is %s' % self.state.played_in_a_row, 2)
+            next_up_page.set_credits_countdown(int(ceil(credits_duration)) if credits_deadline is not None else None)
             next_up_page.show()
+            self.popup_shown = True
             set_property('service.upnext.dialog', 'true')
             showing_next_up_page = True
         else:
+            credits_deadline = None
             self.log('showing still watching page as played in a row %s' % self.state.played_in_a_row, 2)
             still_watching_page.show()
+            self.popup_shown = True
             set_property('service.upnext.dialog', 'true')
             showing_still_watching_page = True
         while (self.player.isPlaying() and (total_time - play_time > 1)
-               and not next_up_page.is_cancel() and not next_up_page.is_watch_now()
+               and (credits_deadline is not None or remaining > 1)
+               and not next_up_page.is_cancel() and not next_up_page.is_watch_now() and not next_up_page.is_auto_advance()
                and not still_watching_page.is_still_watching() and not still_watching_page.is_cancel()):
-            try:
-                play_time = self.player.getTime()
-                total_time = self.notify_start + self.duration
-            except RuntimeError:
+            position = self._playback_position(playing_file)
+            if position is None:
+                self.log('Playback stopped or changed while the popup was open, closing it', 2)
                 if showing_next_up_page:
                     next_up_page.close()
                     showing_next_up_page = False
@@ -193,16 +230,121 @@ class PlaybackManager:
                     still_watching_page.close()
                     showing_still_watching_page = False
                 break
+            play_time, total_time = position
+            self.state.watch_timer.observe(playing_file, play_time, self.state.pause)
 
-            remaining = total_time - play_time
-            runtime = episode.get('runtime')
+            remaining = min(total_time, popup_deadline) - play_time
+            showing_next_up_page, showing_still_watching_page, credits_deadline = self.check_late_watch_limit(
+                next_up_page, still_watching_page, showing_next=showing_next_up_page,
+                showing_still=showing_still_watching_page, episode_limit=played_in_a_row_number,
+                remaining=remaining, credits_deadline=credits_deadline, play_time=play_time)
             if not self.state.pause:
                 if showing_next_up_page:
-                    next_up_page.update_progress_control(remaining=remaining, runtime=runtime)
+                    if credits_deadline is not None:
+                        remaining = max(0, min(remaining, credits_deadline - play_time))
+                        self._update_credits_progress(next_up_page, remaining, credits_duration)
+                    else:
+                        next_up_page.update_progress_control(remaining=remaining, runtime=episode.get('runtime'))
                 elif showing_still_watching_page:
-                    still_watching_page.update_progress_control(remaining=remaining, runtime=runtime)
+                    still_watching_page.update_progress_control(remaining=remaining, runtime=episode.get('runtime'))
             sleep(100)
         return showing_next_up_page, showing_still_watching_page
+
+    def check_late_watch_limit(self, next_page, still_page, *, showing_next, showing_still,
+                               episode_limit, remaining, credits_deadline, play_time):
+        if showing_next:
+            next_page.restore_after_playback_controls()
+        if (not showing_next or self.state.pause or next_page.is_cancel() or next_page.is_watch_now()
+                or next_page.is_auto_advance()):
+            return showing_next, showing_still, credits_deadline
+        if not self.late_watch_limit_due(episode_limit, remaining, credits_deadline, play_time):
+            return showing_next, showing_still, credits_deadline
+        # Do not override an explicit action that arrived while settings were read.
+        if next_page.is_cancel() or next_page.is_watch_now() or next_page.is_auto_advance():
+            return showing_next, showing_still, credits_deadline
+        next_page.close()
+        still_page.show()
+        return False, True, None
+
+    def still_watching_due(self, episode_limit):
+        return (bool(episode_limit and int(self.state.played_in_a_row) >= int(episode_limit))
+                or self.state.watch_timer.due(get_setting_int('stillWatchingMinutes') or 0,
+                                              get_setting_bool('bedtimeEnabled'),
+                                              get_setting_int('bedtimeHour') or 0,
+                                              get_setting_int('bedtimeMinute') or 0))
+
+    def late_watch_limit_due(self, episode_limit, remaining, credits_deadline, play_time):
+        now = monotonic()
+        critical = remaining <= 2 or (credits_deadline is not None and credits_deadline - play_time <= 1)
+        if now < self._watch_limit_check_at and not critical:
+            return False
+        self._watch_limit_check_at = now + 1
+        return self.still_watching_due(episode_limit)
+
+    def _playback_position(self, playing_file):
+        """Return (play_time, total_time) while the popup's own file is playing, otherwise None"""
+        try:
+            # Times and the credits deadline only apply to the file the popup was opened for
+            if self.player.getPlayingFile() != playing_file:
+                return None
+            return self.player.getTime(), self.player.getTotalTime()
+        except RuntimeError:
+            return None
+
+    @staticmethod
+    def _update_credits_progress(page, remaining, duration):
+        progress = 100 * remaining / duration if duration > 0 else 0
+        page.set_credits_countdown(int(ceil(remaining)))
+        page.update_progress_control(remaining=int(ceil(remaining)), runtime=page.item.get('runtime'), progress=progress)
+        if remaining <= 0:
+            # Keep autoplay distinct from Watch Now so Still Watching counts survive.
+            page.set_auto_advance()
+
+    def remember_watched_state(self, episodeid, source, next_episodeid=None):
+        """Note a library episode's play count as Up Next moves on, so it can be marked watched if Kodi doesn't"""
+        # Add-on episodes keep their watched state in the add-on, and only library lookups have a library ID
+        if source != 'library' or get_int(episodeid, default=0) < 1 or not get_setting_bool('markWatchedEarly', default=True):
+            return
+        watched = get_watched_state(episodeid)
+        try:
+            playing_file = self.player.getPlayingFile()
+        except RuntimeError:
+            playing_file = None
+        if watched is not None and playing_file:
+            self._watched_checks.append({'episodeid': episodeid, 'playcount': watched[0], 'file': playing_file,
+                                         'next': next_episodeid, 'started': monotonic(), 'switched': None})
+
+    def check_previous_watched(self):
+        """Mark episodes Up Next moved on from as watched when Kodi didn't count them"""
+        # Kodi only counts an episode stopped after playcountminimumpercent (90% by default), so Watch Now or
+        # the credits delay can leave it unwatched with a resume point. Only act once the next episode is
+        # playing, and only after Kodi has saved the previous one: that avoids counting it twice, and Kodi's
+        # resume point overwriting this.
+        if not self._watched_checks:
+            return
+        now = monotonic()
+        try:
+            playing_file = self.player.getPlayingFile()
+        except RuntimeError:
+            playing_file = None
+        for check in list(self._watched_checks):
+            if check['switched'] is None:
+                playing = playing_episode_id() if playing_file and playing_file != check['file'] else None
+                if playing is not None and playing == check['next']:
+                    check['switched'] = now
+                elif playing not in (None, check['episodeid']) or now - check['started'] > WATCHED_SWITCH_TIMEOUT:
+                    # Another episode is playing, or the next one never started: Up Next didn't move on.
+                    # Without item details yet, or for a video that isn't a library episode, keep waiting.
+                    self._watched_checks.remove(check)
+                continue
+            if now < check['switched'] + WATCHED_CHECK_DELAY:
+                continue
+            self._watched_checks.remove(check)
+            watched = get_watched_state(check['episodeid'])
+            if watched is None or watched[0] > check['playcount']:
+                continue
+            self.log('Marking episode %s as watched, as Kodi did not count it when Up Next moved on' % check['episodeid'], 2)
+            mark_watched(check['episodeid'], check['playcount'] + 1)
 
     def extract_play_info(self, next_up_page, showing_next_up_page, showing_still_watching_page, still_watching_page):
         if showing_next_up_page:
@@ -215,10 +357,15 @@ class PlaybackManager:
             should_play_non_default = still_watching_page.is_still_watching()
         else:
             # FIXME: This is a workaround until we handle this better (see comments in #142)
+            # The popup was already closed because playback stopped or changed
+            clear_property('service.upnext.dialog')
             return False, False
 
         if next_up_page.is_watch_now() or still_watching_page.is_still_watching():
             self.state.played_in_a_row = 1
+            timer = getattr(self.state, 'watch_timer', None)
+            if timer:
+                timer.reset(acknowledge_bedtime=still_watching_page.is_still_watching())
         else:
             self.state.played_in_a_row += 1
         clear_property('service.upnext.dialog')

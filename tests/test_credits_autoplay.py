@@ -1,0 +1,330 @@
+# -*- coding: utf-8 -*-
+# GNU General Public License v2.0 (see COPYING or https://www.gnu.org/licenses/gpl-2.0.txt)
+
+import pytest
+import api
+import playbackmanager
+import upnext
+import watchtimer
+from datetime import datetime, timedelta
+from watchtimer import WatchTimer
+from test_playbackmanager import Stub
+
+
+@pytest.mark.parametrize('offset,delay,play_time,total_time,expected', [
+    (120, 6, 120, 200, 126),
+    ('120', 6, 130, 200, 136),
+    (150, 6, 120, 200, 156),
+    (195, 6, 198, 200, 200),
+    (120, 0, 120, 200, None),
+    (None, 6, 120, 200, None),
+    ('invalid', 6, 120, 200, None),
+    (-1, 6, 120, 200, None),
+    (0, 6, 120, 200, None),
+    (200, 6, 120, 200, None),
+    (float('nan'), 6, 120, 200, None),
+    (float('inf'), 6, 120, 200, None),
+])
+def test_credits_deadline_requires_valid_metadata(monkeypatch, offset, delay, play_time, total_time, expected):
+    instance = object.__new__(api.Api)
+    instance.data = {'notification_offset': offset}
+    monkeypatch.setattr(api, 'get_setting_int', lambda key: delay)
+    assert api.credits_autoplay_deadline(instance.data, play_time, total_time) == expected
+
+
+def test_notification_time_keeps_priority_without_changing_credits_start(monkeypatch):
+    instance = object.__new__(api.Api)
+    instance.data = {'notification_time': 80, 'notification_offset': 150}
+    monkeypatch.setattr(api, 'get_setting_int', lambda key: 6)
+    assert instance.notification_time(total_time=200) == 80
+    assert api.credits_autoplay_deadline(instance.data, 120, 200) == 156
+
+
+@pytest.fixture
+def run_credits(monkeypatch):
+    def run(action=None, offset=120, delay=6, mode=0, source='addon', queued=False, still=False, pause=False,
+            replace=False, runtime=None, timed=False, late=None):
+        events, popups = [], []
+        clock = Stub(time=120.0, ticks=0, active=True, file='current.mkv', replaced=None, window={}, error=None)
+        state = Stub(playing_next=False, queued=False, track=True, include_watched=True,
+                     current_episode_id='current', play_mode=mode, played_in_a_row=1, pause=False,
+                     watch_timer=WatchTimer())
+        if timed:
+            state.watch_timer.elapsed = 61
+        if late == 'time':
+            state.watch_timer.elapsed = 59
+
+        class Popup(upnext.UpNext):
+            def __init__(self, *args):
+                self.cancel = self.dismissed = self.watchnow = self.auto_advance = False
+                self.current_progress_percent = 100
+                self.progress_step_size = 0
+                self.values = []
+                self.properties = {}
+                self.shown_properties = {}
+                popups.append(self)
+
+            def show(self):
+                self.shown_properties = self.properties.copy()
+
+            def close(self):
+                events.append('close')
+
+            def getControl(self, control):  # pylint: disable=invalid-name
+                return Stub(setPercent=lambda percent: None)
+
+            def setProperty(self, key, value):  # pylint: disable=invalid-name
+                self.properties[key] = value
+                if key == 'remaining':
+                    self.values.append(int(value))
+
+        class StillPopup(Popup):
+            stillwatching = False
+
+            def show(self):
+                if late:
+                    events.append('still-shown')
+                super().show()
+
+            def is_still_watching(self):
+                return self.stillwatching
+
+            def update_progress_control(self, **kwargs):
+                pass
+
+        def sleep(milliseconds):
+            clock.ticks += 1
+            assert clock.ticks < 1000, 'Popup did not finish'
+            state.pause = pause and 2 <= clock.ticks <= 5
+            if not state.pause:
+                clock.time += .5
+            if late and 'still-shown' in events and action == 'watch':
+                popups[1].stillwatching = True
+            elif late and 'still-shown' in events and action == 'back':
+                popups[1].onAction(92)
+            elif late and 'still-shown' in events and action == 'stop':
+                popups[1].onClick(3013)
+            elif late and clock.ticks == 2 and action == 'watch-before-limit':
+                popups[0].onClick(3012)
+            if not late and clock.ticks == 2 and action in ('back', 'stop', 'watch'):
+                if action == 'back':
+                    popups[1 if still or timed else 0].onAction(92)
+                elif action == 'watch' and (still or timed):
+                    popups[1].stillwatching = True
+                else:
+                    popups[1 if still or timed else 0].onClick(3013 if action == 'stop' else 3012)
+            if replace and clock.ticks == 2:
+                # Another episode starts and keeps playing past the original credits deadline
+                clock.file = 'replacement.mkv'
+            if action == 'back-at-expiry' and clock.time >= 126:
+                popups[0].onAction(92)
+
+        player = Stub(getTime=lambda: clock.time, getTotalTime=lambda: 200,
+                      getPlayingFile=lambda: clock.file, isPlaying=lambda: clock.active and clock.time < 200,
+                      stop=lambda: events.append('stop'), playnext=lambda: events.append('playlist-next'))
+
+        class Api(api.Api):
+            def __init__(self):
+                self.data = {'notification_offset': offset}
+
+            def queue_next_item(self, episode):
+                return queued
+
+            def dequeue_next_item(self):
+                events.append('dequeue')
+                return False
+
+            def reset_addon_data(self):
+                events.append('reset')
+
+            def play_addon_item(self):
+                events.append('addon-next')
+
+        class Manager(playbackmanager.PlaybackManager):
+            def __init__(self):
+                self.api, self.player, self.state = Api(), player, state
+                self.play_item = Stub(get_next=lambda: ({'episodeid': 'next', 'playcount': 0, 'runtime': runtime}, source))
+
+            def log(self, *args):
+                pass
+
+        def setting(key):
+            return {'simpleMode': 0, 'playedInARow': 1 if still else 15, 'autoPlayCreditsTime': delay,
+                    'stillWatchingMinutes': 1 if timed or late == 'time' else 0, 'bedtimeHour': 23, 'bedtimeMinute': 0}[key]
+
+        monkeypatch.setattr(api, 'get_setting_int', setting)
+        monkeypatch.setattr(playbackmanager, 'get_setting_int', setting)
+        monkeypatch.setattr(playbackmanager, 'get_setting_bool', lambda key: late == 'bedtime' if key == 'bedtimeEnabled' else True)
+        monkeypatch.setattr(playbackmanager, 'monotonic', lambda: clock.time)
+        monkeypatch.setattr(watchtimer, 'monotonic', lambda: clock.time)
+        if late == 'bedtime':
+            monkeypatch.setattr(watchtimer, 'datetime', Stub(now=lambda: datetime(2026, 11, 1, 22, 59, 59) + timedelta(seconds=clock.time - 120)))
+        monkeypatch.setattr(playbackmanager, 'addon_path', lambda: '')
+        monkeypatch.setattr(playbackmanager, 'set_property', clock.window.__setitem__)
+        monkeypatch.setattr(playbackmanager, 'clear_property', lambda key: clock.window.pop(key, None))
+        monkeypatch.setattr(playbackmanager, 'event', lambda **kwargs: events.append('watched'))
+        monkeypatch.setattr(playbackmanager, 'sleep', sleep)
+        monkeypatch.setattr(playbackmanager, 'UpNext', Popup)
+        monkeypatch.setattr(playbackmanager, 'StillWatching', StillPopup)
+        manager = Manager()
+        try:
+            clock.replaced = manager.launch_up_next()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            clock.error = exc
+        return events, state, clock, popups[0]
+
+    return run
+
+
+@pytest.mark.parametrize('source,queued,expected', [
+    ('addon', False, 'addon-next'),
+    ('addon', True, 'playlist-next'),
+    ('playlist', False, 'playlist-next'),
+])
+def test_credits_expiry_advances_once_and_keeps_still_watching_count(run_credits, source, queued, expected):
+    events, state, clock, popup = run_credits(source=source, queued=queued)
+    assert events.count(expected) == 1
+    assert 'stop' not in events
+    assert 126 <= clock.time <= 126.5
+    assert popup.values[0] == 6 and popup.values[-1] == 0
+    assert popup.shown_properties == {'credits_countdown': 'true', 'credits_remaining': '6', 'remaining': '06'}
+    assert popup.properties['credits_remaining'] == '0'
+    assert popup.is_auto_advance() and not popup.is_watch_now()
+    assert state.played_in_a_row == 2
+    assert 'service.upnext.dialog' not in clock.window
+
+
+@pytest.mark.parametrize('action', ['back', 'back-at-expiry'])
+def test_back_during_credits_keeps_video_and_does_not_advance(run_credits, action):
+    events, _, _, _ = run_credits(action=action, queued=True)
+    assert not any(event in events for event in ('stop', 'addon-next', 'playlist-next'))
+    assert events.count('dequeue') == 1
+
+
+def test_elapsed_viewing_time_uses_still_watching_and_resets_on_confirmation(run_credits):
+    events, state, _, _ = run_credits(timed=True, action='watch')
+    assert events.count('addon-next') == 1
+    assert state.watch_timer.elapsed == 0
+    assert state.played_in_a_row == 1
+
+
+@pytest.mark.parametrize('late', ['time', 'bedtime'])
+def test_limit_reached_during_next_popup_requires_confirmation_before_credits_advance(run_credits, late):
+    events, state, _, _ = run_credits(late=late, action='watch', queued=True)
+    assert 'still-shown' in events
+    assert events.count('playlist-next') == 1
+    assert events.index('still-shown') < events.index('playlist-next')
+    assert state.watch_timer.elapsed == 0
+
+
+@pytest.mark.parametrize('late', ['time', 'bedtime'])
+def test_limit_reached_during_popup_does_not_auto_advance_without_confirmation(run_credits, late):
+    events, _, _, _ = run_credits(late=late, queued=True)
+    assert 'still-shown' in events
+    assert 'playlist-next' not in events
+    assert 'dequeue' in events
+
+
+@pytest.mark.parametrize('action', ['back', 'stop'])
+def test_back_and_stop_work_after_switching_to_still_watching(run_credits, action):
+    events, _, _, _ = run_credits(late='time', action=action, queued=True)
+    assert 'still-shown' in events
+    assert 'playlist-next' not in events
+    assert ('stop' in events) == (action == 'stop')
+
+
+def test_explicit_watch_now_is_not_replaced_by_late_prompt(run_credits):
+    events, _, _, _ = run_credits(late='time', action='watch-before-limit', queued=True)
+    assert 'still-shown' not in events
+    assert events.count('playlist-next') == 1
+
+
+@pytest.mark.parametrize('delay', [6, 0])
+@pytest.mark.parametrize('queued', [False, True])
+def test_replacement_playback_closes_popup_without_advancing(run_credits, delay, queued):
+    events, _, clock, popup = run_credits(delay=delay, queued=queued, replace=True)
+    assert events == ['close']
+    assert not popup.is_auto_advance()
+    assert clock.time < 126
+    assert clock.replaced is True
+    assert 'service.upnext.dialog' not in clock.window
+
+
+def test_error_while_popup_is_open_closes_it(run_credits):
+    # A non-numeric runtime from an add-on makes the progress update raise after the popup is shown
+    events, _, clock, _ = run_credits(delay=0, runtime='45')
+    assert isinstance(clock.error, TypeError)
+    assert events.count('close') == 2
+    assert 'service.upnext.dialog' not in clock.window
+
+
+def test_stop_during_credits_is_called_once_after_close(run_credits):
+    events, _, _, _ = run_credits(action='stop', queued=True)
+    assert events.count('stop') == 1
+    assert events.index('close') < events.index('stop')
+    assert not any(event in events for event in ('addon-next', 'playlist-next'))
+
+
+def test_manual_watch_now_is_still_immediate(run_credits):
+    events, state, clock, _ = run_credits(action='watch')
+    assert events.count('addon-next') == 1
+    assert clock.time < 126
+    assert state.played_in_a_row == 1
+
+
+@pytest.mark.parametrize('options', [{'mode': 1}, {'still': True}])
+def test_popup_timeout_preserves_manual_and_still_watching_modes(run_credits, options):
+    _, _, clock, popup = run_credits(**options)
+    assert 129 <= clock.time <= 129.5
+    assert not popup.is_auto_advance()
+    assert popup.properties.get('credits_countdown', '') == ''
+
+
+@pytest.mark.parametrize('source,queued,expected', [
+    ('addon', False, 'addon-next'),
+    ('addon', True, 'playlist-next'),
+    ('playlist', False, 'playlist-next'),
+])
+@pytest.mark.parametrize('options', [{'offset': None}, {'delay': 0}, {'offset': 150}, {'delay': 20}])
+def test_fork_advances_after_ten_seconds_without_waiting_for_credits(run_credits, source, queued, expected, options):
+    events, state, clock, popup = run_credits(source=source, queued=queued, **options)
+    assert clock.error is None
+    assert events.count(expected) == 1
+    assert 'stop' not in events
+    assert 130 <= clock.time <= 130.5
+    assert popup.values[0] == 10 and popup.values[-1] == 0
+    assert popup.is_auto_advance() and not popup.is_watch_now()
+    assert state.played_in_a_row == 2
+
+
+@pytest.mark.parametrize('action', ['back', 'stop'])
+def test_fork_timeout_respects_back_and_stop(run_credits, action):
+    events, _, clock, popup = run_credits(delay=0, action=action, queued=True)
+    assert clock.error is None
+    assert not any(event in events for event in ('addon-next', 'playlist-next'))
+    assert ('stop' in events) == (action == 'stop')
+    assert not popup.is_auto_advance()
+
+
+def test_fork_timeout_freezes_with_paused_video(run_credits):
+    events, _, clock, popup = run_credits(delay=0, pause=True)
+    assert clock.error is None
+    assert events.count('addon-next') == 1
+    assert 130 <= clock.time <= 130.5 and clock.ticks == 25
+    assert popup.values[-1] == 0
+
+
+def test_pause_does_not_use_up_credits_countdown(run_credits):
+    events, _, clock, popup = run_credits(pause=True)
+    assert events.count('addon-next') == 1
+    assert 126 <= clock.time <= 126.5 and clock.ticks == 17
+    assert popup.values[-1] == 0
+
+
+def test_disabling_credits_countdown_clears_previous_skin_properties():
+    popup = object.__new__(upnext.UpNext)
+    properties = {}
+    popup.setProperty = properties.__setitem__
+    popup.set_credits_countdown(6)
+    popup.set_credits_countdown()
+    assert properties['credits_countdown'] == properties['credits_remaining'] == ''

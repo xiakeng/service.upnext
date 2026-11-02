@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 # GNU General Public License v2.0 (see COPYING or https://www.gnu.org/licenses/gpl-2.0.txt)
 
-from __future__ import absolute_import, division, unicode_literals
-import sys
 import json
 from datetime import date
 from re import split as re_split
-from xbmc import executeJSONRPC, getInfoLabel, getRegion, log as xlog, LOGDEBUG, LOGINFO
+from xbmc import executeJSONRPC, getCondVisibility, getRegion, log as xlog, LOGDEBUG, LOGINFO
 from xbmcaddon import Addon
 from xbmcgui import Window
-from statichelper import from_unicode, to_unicode
 
 ADDON = Addon()
 
 
 def get_addon_info(key):
     """Return add-on information"""
-    return to_unicode(ADDON.getAddonInfo(key))
+    return ADDON.getAddonInfo(key)
 
 
 def addon_id():
@@ -29,20 +26,14 @@ def addon_path():
     return get_addon_info('path')
 
 
-def get_kodi_version():
-    """Return Kodi version number as float"""
-    build = getInfoLabel("System.BuildVersion")
-    return float(build[:4])
-
-
 def get_property(key, window_id=10000):
     """Get a Window property"""
-    return to_unicode(Window(window_id).getProperty(key))
+    return Window(window_id).getProperty(key)
 
 
 def set_property(key, value, window_id=10000):
     """Set a Window property"""
-    return Window(window_id).setProperty(key, from_unicode(str(value)))
+    return Window(window_id).setProperty(key, str(value))
 
 
 def clear_property(key, window_id=10000):
@@ -65,11 +56,27 @@ def get_int(obj, key=None, default=-1):
         return val if val else default
 
 
+_SETTINGS = {}
+
+
+def settings_addon():
+    """Return the Addon used to read settings, created once and replaced when the settings change"""
+    # Every new Addon() makes Kodi load the settings files again, so reuse one
+    # until the service monitor's onSettingsChanged() calls reload_settings()
+    if 'addon' not in _SETTINGS:
+        _SETTINGS['addon'] = Addon()
+    return _SETTINGS['addon']
+
+
+def reload_settings():
+    """Read the add-on settings again on next use"""
+    _SETTINGS.clear()
+
+
 def get_setting(key, default=None):
     """Get an add-on setting as string"""
-    # We use Addon() here to ensure changes in settings are reflected instantly
     try:
-        value = to_unicode(Addon().getSetting(key))
+        value = settings_addon().getSetting(key)
     except RuntimeError:  # Occurs when the add-on is disabled
         return default
     if value == '' and default is not None:
@@ -80,7 +87,7 @@ def get_setting(key, default=None):
 def get_setting_bool(key, default=None):
     """Get an add-on setting as boolean"""
     try:
-        return Addon().getSettingBool(key)
+        return settings_addon().getSettingBool(key)
     except (AttributeError, TypeError):  # On Krypton or older, or when not a boolean
         value = get_setting(key, default)
         if value not in ('false', 'true'):
@@ -93,7 +100,7 @@ def get_setting_bool(key, default=None):
 def get_setting_int(key, default=None):
     """Get an add-on setting as integer"""
     try:
-        return Addon().getSettingInt(key)
+        return settings_addon().getSettingInt(key)
     except (AttributeError, TypeError):  # On Krypton or older, or when not an integer
         value = get_setting(key, default)
         try:
@@ -116,9 +123,7 @@ def encode_data(data, encoding='base64'):
     else:
         log("Unknown payload encoding type '%s'" % encoding, level=0)
         return None
-    if sys.version_info[0] > 2:
-        encoded_data = encoded_data.decode('ascii')
-    return encoded_data
+    return encoded_data.decode('ascii')
 
 
 def decode_data(encoded):
@@ -132,8 +137,7 @@ def decode_data(encoded):
         json_data = b64decode(encoded)
     else:
         encoding = 'hex'
-    # NOTE: With Python 3.5 and older json.loads() does not support bytes or bytearray, so we convert to unicode
-    return json.loads(to_unicode(json_data)), encoding
+    return json.loads(json_data), encoding
 
 
 def decode_json(data):
@@ -162,17 +166,12 @@ def event(message, data=None, sender=None, encoding='base64'):
 def log(msg, name=None, level=1):
     """Log information to the Kodi log"""
     log_level = get_setting_int('logLevel', level)
-    debug_logging = get_global_setting('debug.showloginfo')
-    set_property('logLevel', log_level)
+    # A cheap info call instead of a JSON-RPC round trip on every log line
+    debug_logging = getCondVisibility('System.GetBool(debug.showloginfo)')
     if not debug_logging and log_level < level:
         return
-    if debug_logging:
-        level = LOGDEBUG
-    elif get_kodi_version() >= 19:
-        level = LOGINFO
-    else:
-        level = LOGINFO + 1
-    xlog('[%s] %s -> %s' % (addon_id(), name, from_unicode(msg)), level=level)
+    level = LOGDEBUG if debug_logging else LOGINFO
+    xlog('[%s] %s -> %s' % (addon_id(), name, msg), level=level)
 
 
 def calculate_progress_steps(period):
@@ -189,13 +188,6 @@ def jsonrpc(**kwargs):
     if kwargs.get('jsonrpc') is None:
         kwargs.update(jsonrpc='2.0')
     return json.loads(executeJSONRPC(json.dumps(kwargs)))
-
-
-def get_global_setting(setting):
-    """Get a Kodi setting"""
-    result = jsonrpc(method='Settings.GetSettingValue',
-                     params={'setting': setting})
-    return result.get('result', {}).get('value')
 
 
 def localize(string_id):
@@ -215,8 +207,9 @@ def localize_date(date_string):
             int(part)
             for part in re_split(r'[\W]', date_string)[:3]
         ))
-    except ValueError:
-        return date_string
+    except (TypeError, ValueError):
+        # Not a full date, e.g. a year-only firstaired from an add-on, or no date at all
+        return '' if date_string is None else str(date_string)
 
     return date_object.strftime(date_format)
 
@@ -225,21 +218,7 @@ def localize_time(time):
     """Localize time format"""
     time_format = getRegion('time')
 
-    # Fix a bug in Kodi v18.5 and older causing double hours
-    # https://github.com/xbmc/xbmc/pull/17380
-    time_format = time_format.replace('%H%H:', '%H:')
-
     # Strip off seconds
     time_format = time_format.replace(':%S', '')
 
     return time.strftime(time_format)
-
-
-def kodi_version():
-    """Returns full Kodi version as string"""
-    return getInfoLabel('System.BuildVersion').split(' ')[0]
-
-
-def kodi_version_major():
-    """Returns major Kodi version as integer"""
-    return int(kodi_version().split('.')[0])
